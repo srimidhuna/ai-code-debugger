@@ -241,7 +241,9 @@ describe('Phase 3 — DebuggerPage & Components Tests', () => {
     expect(applyBtn).not.toBeDisabled();
     expect(rejectBtn).not.toBeDisabled();
 
-    fireEvent.click(applyBtn);
+    await act(async () => {
+      fireEvent.click(applyBtn);
+    });
     expect(onApply).toHaveBeenCalledTimes(1);
   });
 
@@ -263,7 +265,9 @@ describe('Phase 3 — DebuggerPage & Components Tests', () => {
     );
 
     const rejectBtn = screen.getByTestId('reject-fix-btn');
-    fireEvent.click(rejectBtn);
+    await act(async () => {
+      fireEvent.click(rejectBtn);
+    });
     expect(onReject).toHaveBeenCalledTimes(1);
 
     const restoreBtn = screen.getByTestId('restore-original-btn');

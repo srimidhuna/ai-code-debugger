@@ -291,7 +291,18 @@ def validate_and_apply_edits(
                 current_line += 1
             # Substitute replacement text if not deletion
             if edit.replacement_text:
-                new_lines.extend(edit.replacement_text.splitlines())
+                rep_lines = edit.replacement_text.splitlines()
+                # If the original line had indentation and the replacement lines have none at all,
+                # inherit the original line's indentation to ensure Python and block syntax remain valid.
+                orig_target_line = orig_lines[edit.start_line - 1]
+                orig_indent = orig_target_line[: len(orig_target_line) - len(orig_target_line.lstrip())]
+                if orig_indent and rep_lines:
+                    min_rep_indent = min(
+                        len(l) - len(l.lstrip()) for l in rep_lines if l.strip()
+                    ) if any(l.strip() for l in rep_lines) else 0
+                    if min_rep_indent == 0:
+                        rep_lines = [f"{orig_indent}{l}" if l.strip() else l for l in rep_lines]
+                new_lines.extend(rep_lines)
             # Skip replaced lines in original
             current_line = edit.end_line + 1
 
@@ -468,11 +479,11 @@ class DebuggingService:
                     f"at line {syn_err.lineno}."
                 ) from syn_err
 
-        # 3. General check: abnormal whitespace runs indicating stripped newlines
+        # 3. General check: abnormal horizontal whitespace runs indicating stripped newlines
         abnormal_patterns = [
-            r'=\s{4,}(?:for|while|if|def|class|return|function)\b',
-            r';\s{4,}(?:for|while|if|def|class|return|int|float|double|char|void)\b',
-            r'\}\s{4,}(?:for|while|if|def|class|return|int|float|double|char|void)\b',
+            r'=[ \t]{4,}(?:for|while|if|def|class|return|function)\b',
+            r';[ \t]{4,}(?:for|while|if|def|class|return|int|float|double|char|void)\b',
+            r'\}[ \t]{4,}(?:for|while|if|def|class|return|int|float|double|char|void)\b',
             r'[a-zA-Z0-9_\)\]\}\+\-\*\/]return\b',
         ]
         for pattern in abnormal_patterns:

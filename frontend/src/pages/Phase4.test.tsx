@@ -91,6 +91,7 @@ describe('HistoryPage', () => {
   it('renders search input and language filter', async () => {
     fetchHistory.mockResolvedValue({ total: 0, page: 1, page_size: 10, sessions: [] });
     renderWithRouter(<HistoryPage />);
+    await waitFor(() => expect(screen.getByTestId('history-empty')).toBeInTheDocument());
     expect(screen.getByTestId('history-search-input')).toBeInTheDocument();
     expect(screen.getByTestId('history-language-filter')).toBeInTheDocument();
     expect(screen.getByTestId('history-decision-filter')).toBeInTheDocument();
