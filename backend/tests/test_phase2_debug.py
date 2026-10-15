@@ -19,6 +19,7 @@ from app.core.exceptions import (
     AIValidationError,
 )
 from app.services.debugging_service import (
+    extract_tagged_metadata_from_text,
     extract_json_from_text,
     extract_edits_from_text,
     validate_and_apply_edits,
@@ -72,66 +73,212 @@ METADATA_DICT = {
 }
 
 def make_valid_reply(metadata: dict = None, edits: list = None) -> str:
-    """Build the two-part format the service expects: JSON metadata followed by <edit> blocks."""
+    """Build the tagged block format the service expects: <summary>, <issue>, <change>, <edit>."""
     m = metadata if metadata is not None else METADATA_DICT
-    json_part = json.dumps(m)
+    summary = m.get("summary", "Analysis complete.")
+    issues_xml = []
+    for iss in m.get("issues", []):
+        issues_xml.append(
+            f"<issue>\n"
+            f"<title>{iss.get('title', '')}</title>\n"
+            f"<severity>{iss.get('severity', 'High')}</severity>\n"
+            f"<category>{iss.get('category', 'Logic')}</category>\n"
+            f"<line>{iss.get('line', '')}</line>\n"
+            f"<line_end>{iss.get('line_end', '')}</line_end>\n"
+            f"<explanation>{iss.get('explanation', '')}</explanation>\n"
+            f"<suggestion>{iss.get('suggestion', '')}</suggestion>\n"
+            f"</issue>"
+        )
+    changes_xml = []
+    for ch in m.get("changes", []):
+        changes_xml.append(
+            f"<change>\n"
+            f"<description>{ch.get('description', '')}</description>\n"
+            f"<reason>{ch.get('reason', '')}</reason>\n"
+            f"</change>"
+        )
+    concerns = "\n".join(f"<concern>{c}</concern>" for c in m.get("remaining_concerns", []))
+
     if edits is None:
-        # Default single-line edit replacing line 1: "def solve():"
         edits = [
             '<edit start="1" end="1">\n<replacement>\ndef solve():\n</replacement>\n</edit>'
         ]
     edits_part = "\n\n".join(edits)
-    return f"{json_part}\n\n{edits_part}"
 
-# ─── Unit tests: extract_json_from_text ──────────────────────────────────────
+    return (
+        f"<summary>\n{summary}\n</summary>\n\n"
+        + "\n\n".join(issues_xml) + "\n\n"
+        + "\n\n".join(changes_xml) + "\n\n"
+        + f"<remaining_concerns>\n{concerns}\n</remaining_concerns>\n\n"
+        + f"{edits_part}"
+    )
 
-def test_extract_plain_json():
-    raw = '{"summary": "ok", "issues": [], "changes": [], "remaining_concerns": []}'
-    result = extract_json_from_text(raw)
-    assert result["summary"] == "ok"
+# ─── Unit tests: extract_tagged_metadata_from_text ───────────────────────────
 
-def test_extract_fenced_json():
-    raw = '```json\n{"summary": "fenced", "issues": []}\n```'
-    result = extract_json_from_text(raw)
-    assert result["summary"] == "fenced"
-
-def test_extract_plain_fenced_json():
-    raw = '```\n{"summary": "plain fence"}\n```'
-    result = extract_json_from_text(raw)
-    assert result["summary"] == "plain fence"
-
-def test_extract_trailing_commas():
-    raw = '{"summary": "tc", "issues": [], "changes": [], "remaining_concerns": [],}'
-    result = extract_json_from_text(raw)
-    assert result["summary"] == "tc"
-
-def test_extract_trailing_comma_in_array():
-    raw = '{"summary": "arr", "issues": [{"a": 1},], "changes": [], "remaining_concerns": []}'
-    result = extract_json_from_text(raw)
-    assert result["summary"] == "arr"
-
-def test_extract_unquoted_key():
-    # Simulate bare key 'title'
-    raw = '{"summary": "uq", issues: [], "changes": [], "remaining_concerns": []}'
-    result = extract_json_from_text(raw)
-    assert result["summary"] == "uq"
-
-def test_extract_json_with_surrounding_prose():
-    raw = 'Here is the analysis:\n{"summary": "prose", "issues": []}\nDone.'
-    result = extract_json_from_text(raw)
-    assert result["summary"] == "prose"
-
-def test_extract_json_with_unescaped_inner_quotes():
-    raw = '{"summary": "test", "issues": [{"title": "t", "explanation": "The variable "max_val" is wrong"}], "changes": [], "remaining_concerns": []}'
-    result = extract_json_from_text(raw)
-    assert result["summary"] == "test"
+def test_extract_plain_tagged_metadata():
+    raw = (
+        "<summary>Analysis ok</summary>\n"
+        "<issue>\n"
+        "<title>Off by one</title>\n"
+        "<severity>High</severity>\n"
+        "<category>Logic</category>\n"
+        "<line>5</line>\n"
+        "<line_end>5</line_end>\n"
+        "<explanation>Loop exceeds boundary</explanation>\n"
+        "<suggestion>Use < instead of <=</suggestion>\n"
+        "</issue>\n"
+        "<change>\n"
+        "<description>Fixed loop bound</description>\n"
+        "<reason>Prevent bounds error</reason>\n"
+        "</change>\n"
+        "<remaining_concerns>None</remaining_concerns>"
+    )
+    result = extract_tagged_metadata_from_text(raw)
+    assert result["summary"] == "Analysis ok"
     assert len(result["issues"]) == 1
+    assert result["issues"][0]["title"] == "Off by one"
+    assert result["issues"][0]["line"] == 5
+    assert len(result["changes"]) == 1
 
-def test_extract_json_with_missing_comma_delimiter():
-    raw = '{"summary": "test" "issues": [{"title": "t" "category": "Logic"}] "changes": [] "remaining_concerns": []}'
-    result = extract_json_from_text(raw)
-    assert result["summary"] == "test"
-    assert len(result["issues"]) == 1
+def test_extract_tagged_quotes_and_code_in_explanations():
+    raw = (
+        "<summary>Code check</summary>\n"
+        "<issue>\n"
+        "<title>Syntax bug</title>\n"
+        "<severity>Critical</severity>\n"
+        "<category>Syntax</category>\n"
+        "<line>2</line>\n"
+        "<line_end>2</line_end>\n"
+        "<explanation>Calling role == \"admin\" does not check value, and printf(\"%d\\n\", x); has \"quotes\"</explanation>\n"
+        "<suggestion>Use `role.equals(\"admin\")` instead</suggestion>\n"
+        "</issue>"
+    )
+    result = extract_tagged_metadata_from_text(raw)
+    assert 'role == "admin"' in result["issues"][0]["explanation"]
+    assert 'role.equals("admin")' in result["issues"][0]["suggestion"]
+
+def test_extract_tagged_missing_optional_tags():
+    raw = (
+        "<summary>Summary</summary>\n"
+        "<issue>\n"
+        "<title>Simple issue</title>\n"
+        "<severity>Low</severity>\n"
+        "<category>Code Quality</category>\n"
+        "<explanation>No line number provided</explanation>\n"
+        "<suggestion>Clean up code</suggestion>\n"
+        "</issue>"
+    )
+    result = extract_tagged_metadata_from_text(raw)
+    assert result["issues"][0]["line"] is None
+    assert result["issues"][0]["line_end"] is None
+    assert result["changes"] == []
+    assert result["remaining_concerns"] == []
+
+def test_extract_tagged_multiple_issues():
+    raw = (
+        "<summary>Multiple issues found</summary>\n"
+        "<issue>\n"
+        "<title>Issue 1</title>\n"
+        "<severity>High</severity>\n"
+        "<category>Logic</category>\n"
+        "<line>3</line>\n"
+        "<line_end>3</line_end>\n"
+        "<explanation>First</explanation>\n"
+        "<suggestion>Fix first</suggestion>\n"
+        "</issue>\n"
+        "<issue>\n"
+        "<title>Issue 2</title>\n"
+        "<severity>Medium</severity>\n"
+        "<category>Runtime</category>\n"
+        "<line>10</line>\n"
+        "<line_end>12</line_end>\n"
+        "<explanation>Second</explanation>\n"
+        "<suggestion>Fix second</suggestion>\n"
+        "</issue>"
+    )
+    result = extract_tagged_metadata_from_text(raw)
+    assert len(result["issues"]) == 2
+    assert result["issues"][0]["line"] == 3
+    assert result["issues"][1]["line_end"] == 12
+
+def test_extract_tagged_exact_java_regression():
+    """Exact raw pattern from Qwen that produced the 'suggestion:' missing key error in JSON."""
+    raw = (
+        "<summary>The code contains several issues related to string comparison, array indexing, and loop conditions.</summary>\n\n"
+        "<issue>\n"
+        "<title>String Comparison Using ==</title>\n"
+        "<severity>High</severity>\n"
+        "<category>Logic</category>\n"
+        "<line>3</line>\n"
+        "<line_end>3</line_end>\n"
+        "<explanation>The code uses '==' to compare strings, which checks for reference equality rather than value equality.</explanation>\n"
+        "<suggestion>Use .equals() method for string comparison.</suggestion>\n"
+        "</issue>\n\n"
+        "<issue>\n"
+        "<title>Array Index Out of Bounds</title>\n"
+        "<severity>Critical</severity>\n"
+        "<category>Runtime</category>\n"
+        "<line>8</line>\n"
+        "<line_end>8</line_end>\n"
+        "<explanation>The code attempts to access words[1], which will throw an ArrayIndexOutOfBoundsException if the input string has less than two words.</explanation>\n"
+        "<suggestion>Change the index to 0 or check if the array length is greater than 1.</suggestion>\n"
+        "</issue>\n\n"
+        "<change>\n"
+        "<description>Replaced '==' with '.equals()'</description>\n"
+        "<reason>To correctly compare string values.</reason>\n"
+        "</change>\n\n"
+        "<remaining_concerns>None</remaining_concerns>\n\n"
+        '<edit start="3" end="3">\n<replacement>\n        return role.equals("admin");\n</replacement>\n</edit>'
+    )
+    result = extract_tagged_metadata_from_text(raw)
+    assert len(result["issues"]) == 2
+    assert result["issues"][1]["title"] == "Array Index Out of Bounds"
+    assert result["issues"][1]["suggestion"] == "Change the index to 0 or check if the array length is greater than 1."
+    assert len(result["changes"]) == 1
+
+def test_extract_json_fallback_compatibility():
+    raw_json = '{"summary": "json fallback", "issues": [], "changes": [], "remaining_concerns": []}'
+    result = extract_tagged_metadata_from_text(raw_json)
+    assert result["summary"] == "json fallback"
+
+def test_tagged_invalid_severity_triggers_validation_error():
+    """Invalid severity value (e.g. 'Urgent') must be rejected by Pydantic schema validation."""
+    from app.schemas.debug import AIAnalysisResult
+    raw = (
+        "<summary>Analysis</summary>\n"
+        "<issue>\n"
+        "<title>Bug</title>\n"
+        "<severity>Urgent</severity>\n"
+        "<category>Logic</category>\n"
+        "<line>1</line>\n"
+        "<explanation>Bug details</explanation>\n"
+        "<suggestion>Fix</suggestion>\n"
+        "</issue>"
+    )
+    data = extract_tagged_metadata_from_text(raw)
+    data["fixed_code"] = "x = 1"
+    with pytest.raises(Exception):
+        AIAnalysisResult.model_validate(data)
+
+def test_tagged_missing_line_number_allowed():
+    """File-wide or general issues without line numbers parse with line=None."""
+    from app.schemas.debug import AIAnalysisResult
+    raw = (
+        "<summary>Analysis</summary>\n"
+        "<issue>\n"
+        "<title>General quality note</title>\n"
+        "<severity>Low</severity>\n"
+        "<category>Code Quality</category>\n"
+        "<explanation>Entire module could use docstrings.</explanation>\n"
+        "<suggestion>Add module docstrings.</suggestion>\n"
+        "</issue>"
+    )
+    data = extract_tagged_metadata_from_text(raw)
+    data["fixed_code"] = "x = 1"
+    validated = AIAnalysisResult.model_validate(data)
+    assert validated.issues[0].line is None
+    assert validated.issues[0].line_end is None
+
 
 
 # ─── Unit tests: extract_edits_from_text & validate_and_apply_edits ─────────
@@ -204,16 +351,126 @@ def test_patch_deletion():
     assert fixed == "def solve():\n    return 42\n"
 
 
-# Required Test 5: Overlapping edits rejected
-def test_patch_overlapping_edits_rejected():
+# Test 5a: Overlapping edits are MERGED (wider edit wins), not rejected
+def test_patch_overlapping_edits_merged_wider_wins():
+    """Model emits a wide edit [1-3] and a narrow edit [2-2]; the wide one wins."""
     orig = "line 1\nline 2\nline 3\nline 4\n"
     edits = [
-        CodeEdit(start_line=1, end_line=3, replacement_text="new 1-3"),
-        CodeEdit(start_line=2, end_line=4, replacement_text="new 2-4"),
+        CodeEdit(start_line=1, end_line=3, replacement_text="FIXED 1-3"),
+        CodeEdit(start_line=2, end_line=2, replacement_text="FIXED 2 only"),  # narrower, inside
     ]
-    with pytest.raises(AIValidationError) as exc:
-        validate_and_apply_edits(orig, edits, total_lines=4)
-    assert "overlapping" in str(exc.value).lower()
+    fixed = validate_and_apply_edits(orig, edits, total_lines=4)
+    # The wide edit [1-3] covers lines 1-3; its replacement wins.
+    # Line 4 is untouched.
+    assert "FIXED 1-3" in fixed
+    assert "FIXED 2 only" not in fixed
+    assert "line 4" in fixed
+
+
+# Test 5b: Program-2-style merge — wide block edit + narrow trailing line edit
+def test_patch_overlapping_edits_program2_pattern():
+    """Regression: Qwen emits edit[7-12] to fix find_index and a second edit[12-12].
+    The wide edit should win and the result should not raise."""
+    code = (
+        "def find_index(lst, target):\n"    # 1
+        "    for i, val in enumerate(lst):\n"  # 2
+        "        if val == target:\n"       # 3
+        "            return i\n"            # 4
+        "        else:\n"                   # 5
+        "            return -1\n"           # 6
+    )
+    wide_fix = (
+        "def find_index(lst, target):\n"
+        "    for i, val in enumerate(lst):\n"
+        "        if val == target:\n"
+        "            return i\n"
+        "    return -1\n"
+    )
+    edits = [
+        CodeEdit(start_line=1, end_line=6, replacement_text=wide_fix),  # whole function
+        CodeEdit(start_line=6, end_line=6, replacement_text="    return -1\n"),  # narrow dup
+    ]
+    warnings = []
+    fixed = validate_and_apply_edits(code, edits, total_lines=6, warnings=warnings)
+    assert "return -1" in fixed
+    # Replacement for the overlap should not double-add the line
+    assert fixed.count("return -1") == 1
+    # Overlapping edit must record a warning in warnings
+    assert len(warnings) == 1
+    assert "Merged overlapping edits" in warnings[0]
+
+
+# Test 5c: Truly irreconcilable edits (same start, different non-overlapping ends after merge)
+# are still rejected if they cannot be merged to a valid single edit.
+def test_patch_truly_non_overlapping_edits_still_rejected():
+    """Two edits that don't overlap at all but are out-of-order are still rejected."""
+    orig = "line 1\nline 2\nline 3\nline 4\n"
+    edits = [
+        CodeEdit(start_line=3, end_line=4, replacement_text="new 3-4"),
+        CodeEdit(start_line=1, end_line=2, replacement_text="new 1-2"),
+    ]
+    # After sort: [1-2] then [3-4] — these are non-overlapping and valid, should pass
+    fixed = validate_and_apply_edits(orig, edits, total_lines=4)
+    assert "new 1-2" in fixed
+    assert "new 3-4" in fixed
+
+
+# Test for relative-indent adjustment — over-indented single line (shift LEFT)
+def test_patch_over_indented_single_line_replacement_shifted_left():
+    """Model emits 8-space replacement for a 4-space context -> shift left by 4."""
+    orig = (
+        "def factorial(n):\n"
+        "    result = 1\n"
+        "    for i in range(1, n):\n"
+        "        result *= i\n"
+        "    return result\n"
+    )
+    # Model gives 8-space replacement for a 4-space line
+    edits = [
+        CodeEdit(start_line=3, end_line=3,
+                 replacement_text="        for i in range(1, n + 1):")
+    ]
+    fixed = validate_and_apply_edits(orig, edits, total_lines=5)
+    assert "    for i in range(1, n + 1):" in fixed     # shifted to 4 spaces
+    assert "        for i in range(1, n + 1):" not in fixed  # NOT 8 spaces
+
+
+# Test for relative-indent adjustment — over-indented multi-line (shift LEFT)
+def test_patch_over_indented_multi_line_replacement_shifted_left():
+    """Program 2 pattern: model emits 8-space block for a 4-space context (edit [3-4])."""
+    orig = (
+        "def factorial(n):\n"
+        "    result = 1\n"
+        "    for i in range(1, n):\n"
+        "        result *= i\n"
+        "    return result\n"
+    )
+    # Model over-indents the 2-line replacement by 4 extra spaces
+    edits = [
+        CodeEdit(start_line=3, end_line=4,
+                 replacement_text="        for i in range(1, n + 1):\n            result *= i")
+    ]
+    fixed = validate_and_apply_edits(orig, edits, total_lines=5)
+    lines = fixed.splitlines()
+    assert lines[2] == "    for i in range(1, n + 1):"   # 4 spaces
+    assert lines[3] == "        result *= i"              # 8 spaces
+
+
+# Test for relative-indent adjustment — under-indented single line (shift RIGHT)
+def test_patch_under_indented_replacement_shifted_right():
+    """Model emits 0-space replacement for a 4-space context -> shift right by 4."""
+    orig = (
+        "def foo():\n"
+        "    x = 1\n"
+        "    x = bad_value\n"
+        "    return x\n"
+    )
+    edits = [
+        CodeEdit(start_line=3, end_line=3, replacement_text="x = correct_value")
+    ]
+    fixed = validate_and_apply_edits(orig, edits, total_lines=4)
+    assert "    x = correct_value" in fixed   # indentation added
+    assert "x = correct_value\n" not in fixed or "    x = correct_value" in fixed
 
 
 # Required Test 6: Out-of-range rejected
@@ -716,10 +973,11 @@ async def test_prompt_behavioural_rules_reach_model():
     assert system_msg is not None, "No system message was sent to the model"
     content = system_msg["content"]
 
-    # All four rules must be present in what the model actually sees
+    # All behavioral rules must be present in what the model actually sees
     assert "ORIGINAL code" in content
     assert "provably" in content
     assert "new behaviour" in content or "new behavior" in content
     assert "One issue per bug" in content or "each distinct bug" in content
     assert "tight line range" in content or "specific line" in content
     assert "not the whole function" in content
+    assert "fix the index" in content or "don't add guards" in content

@@ -98,6 +98,95 @@ def _repair_unquoted_keys(text: str) -> str:
     )
 
 
+def _extract_tag_content(tag: str, text: str, default: str = "") -> str:
+    """Extract content inside <tag>...</tag>, ignoring case and trimming whitespace."""
+    match = re.search(rf"<{tag}>(.*?)</{tag}>", text, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return default
+
+
+def extract_tagged_metadata_from_text(text: str) -> dict:
+    """Tolerantly extract summary, issues, changes, and remaining_concerns from tagged blocks.
+
+    Handles:
+    - <summary>...</summary>
+    - Multiple <issue>...</issue> blocks with <title>, <severity>, <category>, <line>, <line_end>, <explanation>, <suggestion>
+    - Multiple <change>...</change> blocks with <description>, <reason>
+    - <remaining_concerns>...</remaining_concerns> or <concern>...</concern> tags
+    - Tolerates inner quotes, markdown, code snippets, whitespace, and missing optional tags.
+    """
+    clean = text.strip()
+
+    # 1. Summary
+    summary = _extract_tag_content("summary", clean, "")
+
+    # 2. Issues
+    issues = []
+    issue_blocks = re.findall(r"<issue>(.*?)</issue>", clean, flags=re.IGNORECASE | re.DOTALL)
+    for block in issue_blocks:
+        title = _extract_tag_content("title", block, "")
+        severity = _extract_tag_content("severity", block, "")
+        category = _extract_tag_content("category", block, "")
+        line_str = _extract_tag_content("line", block, "")
+        line_end_str = _extract_tag_content("line_end", block, "")
+        explanation = _extract_tag_content("explanation", block, "")
+        suggestion = _extract_tag_content("suggestion", block, "")
+
+        line_num = int(line_str) if (line_str and line_str.isdigit()) else None
+        line_end_num = int(line_end_str) if (line_end_str and line_end_str.isdigit()) else line_num
+
+        issues.append({
+            "title": title,
+            "severity": severity,
+            "category": category,
+            "line": line_num,
+            "line_end": line_end_num,
+            "explanation": explanation,
+            "suggestion": suggestion,
+        })
+
+    # 3. Changes
+    changes = []
+    change_blocks = re.findall(r"<change>(.*?)</change>", clean, flags=re.IGNORECASE | re.DOTALL)
+    for block in change_blocks:
+        description = _extract_tag_content("description", block, "")
+        reason = _extract_tag_content("reason", block, "")
+        changes.append({
+            "description": description,
+            "reason": reason,
+        })
+
+    # 4. Remaining Concerns
+    remaining_concerns = []
+    concerns_container = _extract_tag_content("remaining_concerns", clean, "")
+    if concerns_container:
+        sub_concerns = re.findall(r"<concern>(.*?)</concern>", concerns_container, flags=re.IGNORECASE | re.DOTALL)
+        if sub_concerns:
+            remaining_concerns = [c.strip() for c in sub_concerns if c.strip()]
+        else:
+            lines = [l.strip().lstrip("-* ").strip() for l in concerns_container.splitlines() if l.strip()]
+            remaining_concerns = [l for l in lines if l.lower() not in ("none", "n/a", "no remaining concerns", "[]")]
+    else:
+        direct_concerns = re.findall(r"<concern>(.*?)</concern>", clean, flags=re.IGNORECASE | re.DOTALL)
+        if direct_concerns:
+            remaining_concerns = [c.strip() for c in direct_concerns if c.strip()]
+
+    # If any tagged blocks were present, return the parsed metadata dict
+    if summary or issues or change_blocks or concerns_container:
+        if not summary:
+            summary = "Code analysis complete."
+        return {
+            "summary": summary,
+            "issues": issues,
+            "changes": changes,
+            "remaining_concerns": remaining_concerns,
+        }
+
+    # Fall back to JSON extraction if no XML tags found
+    return extract_json_from_text(text)
+
+
 def extract_json_from_text(text: str) -> dict:
     """Tolerantly extract and parse the first JSON object from raw LLM output.
 
@@ -161,8 +250,8 @@ def extract_json_from_text(text: str) -> dict:
     try:
         json.loads(clean)
     except json.JSONDecodeError as exc:
-        raise AIValidationError(f"Invalid JSON format in AI response: {exc}") from exc
-    raise AIValidationError("Unable to extract valid JSON metadata from AI response.")
+        raise AIValidationError(f"Invalid JSON/tag format in AI response: {exc}") from exc
+    raise AIValidationError("Unable to extract valid metadata from AI response.")
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +292,7 @@ def validate_and_apply_edits(
     original_code: str,
     edits: List[CodeEdit],
     total_lines: int,
+    warnings: Optional[List[str]] = None,
 ) -> str:
     """Validate and apply line-targeted edits to the original source code.
 
@@ -211,7 +301,8 @@ def validate_and_apply_edits(
     - Ranges inside the file:
         - For replacement / deletion: 1 <= start_line <= end_line <= total_lines.
         - For insertion before start_line: end_line == start_line - 1, 1 <= start_line <= total_lines + 1.
-    - No overlapping or out-of-order edits.
+    - Overlapping edits are automatically merged (the wider edit's replacement wins).
+    - When overlapping edits are merged, a warning is appended to warnings (if provided).
     - Replacement text lines not wildly longer than what they replace (e.g. max 100 extra lines per edit).
 
     Application guarantees:
@@ -232,8 +323,49 @@ def validate_and_apply_edits(
     norm_orig = original_code.replace("\r\n", "\n").replace("\r", "\n")
     orig_lines = norm_orig.splitlines()
 
-    # Sort edits by start_line ascending
-    sorted_edits = sorted(edits, key=lambda e: (e.start_line, e.end_line))
+    # Sort edits by start_line ascending; ties broken widest-range-first so merge keeps wider edit
+    sorted_edits = sorted(edits, key=lambda e: (e.start_line, -e.end_line))
+
+    # -------------------------------------------------------------------------
+    # Merge overlapping edits.
+    # Models sometimes emit both a wide block-level edit and a narrower line-level
+    # edit for the same region (e.g. when restructuring an if/else block they emit
+    # one edit for lines 7-12 and a second edit for line 12).  Keep the wider edit.
+    # -------------------------------------------------------------------------
+    merged: List[CodeEdit] = []
+    for edit in sorted_edits:
+        if not merged:
+            merged.append(edit)
+            continue
+        prev = merged[-1]
+        prev_is_ins = (prev.end_line == prev.start_line - 1)
+        curr_is_ins = (edit.end_line == edit.start_line - 1)
+        if not prev_is_ins and not curr_is_ins and edit.start_line <= prev.end_line:
+            # Overlap detected — merge into the wider range, prefer the text of the
+            # edit that exactly covers the merged span, falling back to prev's text.
+            new_start = min(prev.start_line, edit.start_line)
+            new_end   = max(prev.end_line,   edit.end_line)
+            if prev.start_line == new_start and prev.end_line == new_end:
+                winner_text = prev.replacement_text
+            elif edit.start_line == new_start and edit.end_line == new_end:
+                winner_text = edit.replacement_text
+            else:
+                winner_text = prev.replacement_text  # prev is always the wider due to sort
+            warn_msg = (
+                f"Merged overlapping edits [{prev.start_line}-{prev.end_line}] and "
+                f"[{edit.start_line}-{edit.end_line}] into [{new_start}-{new_end}]."
+            )
+            logger.warning(warn_msg)
+            if warnings is not None:
+                warnings.append(warn_msg)
+            merged[-1] = CodeEdit(
+                start_line=new_start,
+                end_line=new_end,
+                replacement_text=winner_text,
+            )
+        else:
+            merged.append(edit)
+    sorted_edits = merged
 
     # Validate boundaries and overlap
     prev_end = 0
@@ -292,16 +424,35 @@ def validate_and_apply_edits(
             # Substitute replacement text if not deletion
             if edit.replacement_text:
                 rep_lines = edit.replacement_text.splitlines()
-                # If the original line had indentation and the replacement lines have none at all,
-                # inherit the original line's indentation to ensure Python and block syntax remain valid.
+                # Relative-indent adjustment:
+                # The model sometimes over-indents replacement lines relative to where
+                # they will be placed in the file (e.g. uses 8 spaces for a 4-space
+                # indent context).  Correct this by comparing the minimum indentation
+                # of non-empty replacement lines against the original target line's indent.
+                #
+                #  min_rep > orig_level  → over-indented: shift all content lines LEFT
+                #  min_rep == 0 & orig_level > 0 → under-indented: shift content RIGHT
+                #  min_rep == orig_level → already correct, no adjustment
                 orig_target_line = orig_lines[edit.start_line - 1]
-                orig_indent = orig_target_line[: len(orig_target_line) - len(orig_target_line.lstrip())]
-                if orig_indent and rep_lines:
+                orig_level = len(orig_target_line) - len(orig_target_line.lstrip())
+                has_content = any(l.strip() for l in rep_lines)
+                if has_content:
                     min_rep_indent = min(
                         len(l) - len(l.lstrip()) for l in rep_lines if l.strip()
-                    ) if any(l.strip() for l in rep_lines) else 0
-                    if min_rep_indent == 0:
-                        rep_lines = [f"{orig_indent}{l}" if l.strip() else l for l in rep_lines]
+                    )
+                    if min_rep_indent > orig_level:
+                        # Over-indented — shift every content line left by the excess.
+                        # Blank/whitespace-only lines are left as-is.
+                        shift = min_rep_indent - orig_level
+                        rep_lines = [
+                            l[shift:] if l.strip() else l for l in rep_lines
+                        ]
+                    elif min_rep_indent == 0 and orig_level > 0:
+                        # Under-indented — prepend orig indentation to content lines.
+                        orig_indent = " " * orig_level
+                        rep_lines = [
+                            f"{orig_indent}{l}" if l.strip() else l for l in rep_lines
+                        ]
                 new_lines.extend(rep_lines)
             # Skip replaced lines in original
             current_line = edit.end_line + 1
@@ -332,30 +483,29 @@ class DebuggingService:
         system_prompt = (
             "You are an expert AI code debugger. Analyze the provided source code for "
             "syntax errors, logical errors, runtime errors, and code quality issues.\n\n"
-            "Respond with EXACTLY TWO parts:\n\n"
-            "PART 1: A raw JSON object with this exact schema:\n"
-            "{\n"
-            '  "summary": "High-level summary of findings",\n'
-            '  "issues": [\n'
-            "    {\n"
-            '      "title": "Short issue title",\n'
-            '      "severity": "Critical" | "High" | "Medium" | "Low",\n'
-            '      "category": "Syntax" | "Logic" | "Runtime" | "Code Quality",\n'
-            '      "line": <integer 1-based start line or null>,\n'
-            '      "line_end": <integer 1-based end line or null>,\n'
-            '      "explanation": "Why the bug occurs in the ORIGINAL code",\n'
-            '      "suggestion": "How to fix it"\n'
-            "    }\n"
-            "  ],\n"
-            '  "changes": [\n'
-            "    {\n"
-            '      "description": "What changed",\n'
-            '      "reason": "Why"\n'
-            "    }\n"
-            "  ],\n"
-            '  "remaining_concerns": ["Any warnings or ambiguities"]\n'
-            "}\n\n"
-            "PART 2: Line-targeted code edits.\n"
+            "Format your response using structured XML-style tags:\n\n"
+            "<summary>\n"
+            "High-level summary of findings\n"
+            "</summary>\n\n"
+            "For each detected issue, output an <issue> block:\n"
+            "<issue>\n"
+            "<title>Short issue title</title>\n"
+            "<severity>Critical | High | Medium | Low</severity>\n"
+            "<category>Syntax | Logic | Runtime | Code Quality</category>\n"
+            "<line>1-based start line number</line>\n"
+            "<line_end>1-based end line number</line_end>\n"
+            "<explanation>Why the bug occurs in the ORIGINAL code</explanation>\n"
+            "<suggestion>How to fix it</suggestion>\n"
+            "</issue>\n\n"
+            "For each change applied in your fix, output a <change> block:\n"
+            "<change>\n"
+            "<description>What changed</description>\n"
+            "<reason>Why the change was necessary</reason>\n"
+            "</change>\n\n"
+            "<remaining_concerns>\n"
+            "Any warnings, edge cases, or potential concerns (or leave empty if none)\n"
+            "</remaining_concerns>\n\n"
+            "LINE-TARGETED CODE EDITS:\n"
             "Do NOT output the full file. Output ONLY targeted edits for lines that have bugs using this exact syntax:\n\n"
             '<edit start="START_LINE" end="END_LINE">\n'
             "<replacement>\n"
@@ -368,6 +518,27 @@ class DebuggingService:
             "- To delete line 5: <edit start=\"5\" end=\"5\"><replacement></replacement></edit>\n"
             "- To insert new code BEFORE line 8: <edit start=\"8\" end=\"7\"><replacement>new_line</replacement></edit>\n"
             "- If the code is already completely correct, do not output any <edit> blocks.\n\n"
+            "EXAMPLE:\n"
+            "<summary>Fixed off-by-one index error in get_first.</summary>\n"
+            "<issue>\n"
+            "<title>Incorrect Index</title>\n"
+            "<severity>High</severity>\n"
+            "<category>Logic</category>\n"
+            "<line>2</line>\n"
+            "<line_end>2</line_end>\n"
+            "<explanation>words[1] returns the second item; array indices start at 0.</explanation>\n"
+            "<suggestion>Change index to 0.</suggestion>\n"
+            "</issue>\n"
+            "<change>\n"
+            "<description>Changed words[1] to words[0]</description>\n"
+            "<reason>To correctly access the first element</reason>\n"
+            "</change>\n"
+            "<remaining_concerns></remaining_concerns>\n"
+            '<edit start="2" end="2">\n'
+            "<replacement>\n"
+            "    return words[0];\n"
+            "</replacement>\n"
+            "</edit>\n\n"
             "CRITICAL RULES:\n"
             f"1. Valid line numbers: The original source has {total_lines} lines. Only reference valid line numbers (1–{total_lines}). "
             "Never specify overlapping edit ranges. Use specific line numbers or tight line ranges, not the whole function.\n"
@@ -384,14 +555,15 @@ class DebuggingService:
             "6. Check every function in the file separately, including loops that never terminate "
             "(e.g. a while loop whose condition variable is never updated inside the loop body), "
             "and report each distinct bug as its own issue.\n"
-            "7. Keep unaffected code untouched: Do NOT emit edits for functions or lines that do not have bugs."
+            "7. If an index looks wrong (e.g. words[1] for the first word), fix the index; don't add guards.\n"
+            "8. Keep unaffected code untouched: Do NOT emit edits for functions or lines that do not have bugs."
         )
 
         user_prompt = (
             f"Programming Language: {language}\n\n"
             f"Source Code (with 1-based line numbers for reference only):\n"
             f"```\n{numbered_code}\n```\n\n"
-            "Provide Part 1 (JSON metadata) and Part 2 (line-targeted <edit> blocks)."
+            "Analyze the code and respond using the tagged blocks (<summary>, <issue>, <change>, <remaining_concerns>, and <edit> blocks)."
         )
 
         return [
@@ -411,9 +583,10 @@ class DebuggingService:
             "role": "user",
             "content": (
                 f"Your previous response had an issue: {parse_error}\n\n"
-                "Please correct and resubmit. Requirements:\n"
-                "1. PART 1 must be a valid JSON object with all keys double-quoted and no trailing commas.\n"
-                "2. PART 2 must contain line-targeted <edit start=\"...\" end=\"...\"><replacement>...</replacement></edit> "
+                "Please correct and resubmit using tagged blocks:\n"
+                "1. Provide <summary>, <issue> (with <title>, <severity>, <category>, <line>, <line_end>, <explanation>, <suggestion>), "
+                "<change>, and <remaining_concerns> tags.\n"
+                "2. Provide line-targeted <edit start=\"...\" end=\"...\"><replacement>...</replacement></edit> "
                 "blocks. Do NOT output the full file.\n"
                 "3. Ensure line numbers are within range and non-overlapping. Ensure replacement code is properly indented "
                 "with each statement on its own line."
@@ -436,21 +609,25 @@ class DebuggingService:
         edits, remainder = extract_edits_from_text(raw_output)
 
         try:
-            metadata = extract_json_from_text(remainder)
+            metadata = extract_tagged_metadata_from_text(remainder)
         except AIValidationError as exc:
             raise AIValidationError(f"[{stage}] {exc.message}") from exc
 
         # If there are no edits and no issues reported, code is unchanged
         if not edits:
-            # Check if there was legacy full file block
             fixed_code = original_code
         else:
             try:
-                fixed_code = validate_and_apply_edits(original_code, edits, total_lines)
+                # Any warnings from merging overlapping edits are recorded into remaining_concerns
+                concerns_list = metadata.setdefault("remaining_concerns", [])
+                fixed_code = validate_and_apply_edits(
+                    original_code, edits, total_lines, warnings=concerns_list
+                )
             except AIValidationError as exc:
                 raise AIValidationError(f"[{stage}] {exc.message}") from exc
 
         return metadata, fixed_code
+
 
     def _validate_fixed_code_safety(self, original_code: str, fixed_code: str, language: str = "") -> None:
         """Safety check: ensure the corrected code does not have collapsed lines,
